@@ -1,4 +1,4 @@
-import torch, os, cv2
+import torch, cv2
 from model.model import parsingNet
 from utils.common import merge_config
 from utils.dist_utils import dist_print
