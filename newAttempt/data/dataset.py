@@ -4,7 +4,6 @@ import os
 import pdb
 import numpy as np
 import cv2
-from data.mytransforms import find_start_pos
 
 
 def loader_func(path):
