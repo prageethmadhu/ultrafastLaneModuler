@@ -48,7 +48,7 @@ if __name__ == "__main__":
     ])
 
     # Video input and output
-    video_input_path = "crash_ori.mp4"
+    video_input_path = "crash_ori3.mp4"
     video_output_path = "crash2.mp4"
 
     cap = cv2.VideoCapture(video_input_path)
