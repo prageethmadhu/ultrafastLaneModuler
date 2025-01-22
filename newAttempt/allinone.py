@@ -7,8 +7,295 @@ import time
 import torchvision
 import torch.nn.modules
 import argparse
-from utils.config import Config
 import torch.distributed as dist
+import json
+import os.path as osp
+import shutil
+import sys
+import tempfile
+from argparse import  ArgumentParser
+from collections import abc
+from importlib import import_module
+from addict import Dict
+
+"""
+tusimple
+"""
+# DATA
+dataset='Tusimple'
+data_root = None
+
+# TRAIN
+epoch = 100
+batch_size = 32
+optimizer = 'Adam'    #['SGD','Adam']
+# learning_rate = 0.1
+learning_rate = 4e-4
+weight_decay = 1e-4
+momentum = 0.9
+
+scheduler = 'cos'     #['multi', 'cos']
+# steps = [50,75]
+gamma  = 0.1
+warmup = 'linear'
+warmup_iters = 100
+
+# NETWORK
+backbone = '18'
+griding_num = 100
+use_aux = True
+
+# LOSS
+sim_loss_w = 1.0
+shp_loss_w = 0.0
+
+# EXP
+note = ''
+
+log_path = None
+
+# FINETUNE or RESUME MODEL PATH
+finetune = None
+resume = None
+
+# TEST
+test_model = None
+test_work_dir = None
+
+num_lanes = 4
+
+
+"""
+config
+"""
+
+BASE_KEY = '_base_'
+DELETE_KEY = '_delete_'
+
+class ConfigDict(Dict):
+
+    def __missing__(self, name):
+        raise KeyError(name)
+
+    def __getattr__(self, name):
+        try:
+            value = super(ConfigDict, self).__getattr__(name)
+        except KeyError:
+            ex = AttributeError(f"'{self.__class__.__name__}' object has no "
+                                f"attribute '{name}'")
+        except Exception as e:
+            ex = e
+        else:
+            return value
+        raise ex
+
+
+def add_args(parser, cfg, prefix=''):
+    for k, v in cfg.items():
+        if isinstance(v, str):
+            parser.add_argument('--' + prefix + k)
+        elif isinstance(v, int):
+            parser.add_argument('--' + prefix + k, type=int)
+        elif isinstance(v, float):
+            parser.add_argument('--' + prefix + k, type=float)
+        elif isinstance(v, bool):
+            parser.add_argument('--' + prefix + k, action='store_true')
+        elif isinstance(v, dict):
+            add_args(parser, v, prefix + k + '.')
+        elif isinstance(v, abc.Iterable):
+            parser.add_argument('--' + prefix + k, type=type(v[0]), nargs='+')
+        else:
+            print(f'cannot parse key {prefix + k} of type {type(v)}')
+    return parser
+
+
+class Config(object):
+
+    @staticmethod
+    def _file2dict(filename):
+        filename = osp.abspath(osp.expanduser(filename))
+        if filename.endswith('.py'):
+            with tempfile.TemporaryDirectory() as temp_config_dir:
+                temp_config_file = tempfile.NamedTemporaryFile(
+                    dir=temp_config_dir, suffix='.py')
+                temp_config_name = osp.basename(temp_config_file.name)
+                # close temp file
+                temp_config_file.close()
+                shutil.copyfile(filename,
+                                osp.join(temp_config_dir, temp_config_name))
+                temp_module_name = osp.splitext(temp_config_name)[0]
+                sys.path.insert(0, temp_config_dir)
+                mod = import_module(temp_module_name)
+                sys.path.pop(0)
+                cfg_dict = {
+                    name: value
+                    for name, value in mod.__dict__.items()
+                    if not name.startswith('__')
+                }
+                # delete imported module
+                del sys.modules[temp_module_name]
+
+        elif filename.endswith(('.yml', '.yaml', '.json')):
+            import mmcv
+            cfg_dict = mmcv.load(filename)
+        else:
+            raise IOError('Only py/yml/yaml/json type are supported now!')
+
+        cfg_text = filename + '\n'
+        with open(filename, 'r') as f:
+            cfg_text += f.read()
+
+        if BASE_KEY in cfg_dict:
+            cfg_dir = osp.dirname(filename)
+            base_filename = cfg_dict.pop(BASE_KEY)
+            base_filename = base_filename if isinstance(
+                base_filename, list) else [base_filename]
+
+            cfg_dict_list = list()
+            cfg_text_list = list()
+            for f in base_filename:
+                _cfg_dict, _cfg_text = Config._file2dict(osp.join(cfg_dir, f))
+                cfg_dict_list.append(_cfg_dict)
+                cfg_text_list.append(_cfg_text)
+
+            base_cfg_dict = dict()
+            for c in cfg_dict_list:
+                if len(base_cfg_dict.keys() & c.keys()) > 0:
+                    raise KeyError('Duplicate key is not allowed among bases')
+                base_cfg_dict.update(c)
+
+            base_cfg_dict = Config._merge_a_into_b(cfg_dict, base_cfg_dict)
+            cfg_dict = base_cfg_dict
+
+            # merge cfg_text
+            cfg_text_list.append(cfg_text)
+            cfg_text = '\n'.join(cfg_text_list)
+
+        return cfg_dict, cfg_text
+
+    @staticmethod
+    def _merge_a_into_b(a, b):
+        # merge dict `a` into dict `b` (non-inplace). values in `a` will
+        # overwrite `b`.
+        # copy first to avoid inplace modification
+        b = b.copy()
+        for k, v in a.items():
+            if isinstance(v, dict) and k in b and not v.pop(DELETE_KEY, False):
+                if not isinstance(b[k], dict):
+                    raise TypeError(
+                        f'{k}={v} in child config cannot inherit from base '
+                        f'because {k} is a dict in the child config but is of '
+                        f'type {type(b[k])} in base config. You may set '
+                        f'`{DELETE_KEY}=True` to ignore the base config')
+                b[k] = Config._merge_a_into_b(v, b[k])
+            else:
+                b[k] = v
+        return b
+
+    @staticmethod
+    def fromfile(filename):
+        cfg_dict, cfg_text = Config._file2dict(filename)
+        return Config(cfg_dict, cfg_text=cfg_text, filename=filename)
+
+    @staticmethod
+    def auto_argparser(description=None):
+        """Generate argparser from config file automatically (experimental)
+        """
+        partial_parser = ArgumentParser(description=description)
+        partial_parser.add_argument('config', help='config file path')
+        cfg_file = partial_parser.parse_known_args()[0].config
+        cfg = Config.fromfile(cfg_file)
+        parser = ArgumentParser(description=description)
+        parser.add_argument('config', help='config file path')
+        add_args(parser, cfg)
+        return parser, cfg
+
+    def __init__(self, cfg_dict=None, cfg_text=None, filename=None):
+        if cfg_dict is None:
+            cfg_dict = dict()
+        elif not isinstance(cfg_dict, dict):
+            raise TypeError('cfg_dict must be a dict, but '
+                            f'got {type(cfg_dict)}')
+
+        super(Config, self).__setattr__('_cfg_dict', ConfigDict(cfg_dict))
+        super(Config, self).__setattr__('_filename', filename)
+        if cfg_text:
+            text = cfg_text
+        elif filename:
+            with open(filename, 'r') as f:
+                text = f.read()
+        else:
+            text = ''
+        super(Config, self).__setattr__('_text', text)
+
+    @property
+    def filename(self):
+        return self._filename
+
+    @property
+    def text(self):
+        return self._text
+
+
+    def __repr__(self):
+        return f'Config (path: {self.filename}): {self._cfg_dict.__repr__()}'
+
+    def __len__(self):
+        return len(self._cfg_dict)
+
+    def __getattr__(self, name):
+        return getattr(self._cfg_dict, name)
+
+    def __getitem__(self, name):
+        return self._cfg_dict.__getitem__(name)
+
+    def __setattr__(self, name, value):
+        if isinstance(value, dict):
+            value = ConfigDict(value)
+        self._cfg_dict.__setattr__(name, value)
+
+    def __setitem__(self, name, value):
+        if isinstance(value, dict):
+            value = ConfigDict(value)
+        self._cfg_dict.__setitem__(name, value)
+
+    def __iter__(self):
+        return iter(self._cfg_dict)
+
+    def dump(self):
+        cfg_dict = super(Config, self).__getattribute__('_cfg_dict')
+        format_text = json.dumps(cfg_dict, indent=2)
+        return format_text
+
+    def merge_from_dict(self, options):
+        """Merge list into cfg_dict
+        Merge the dict parsed by MultipleKVAction into this cfg.
+        Examples:
+            >>> options = {'model.backbone.depth': 50,
+            ...            'model.backbone.with_cp':True}
+            >>> cfg = Config(dict(model=dict(backbone=dict(type='ResNet'))))
+            >>> cfg.merge_from_dict(options)
+            >>> cfg_dict = super(Config, self).__getattribute__('_cfg_dict')
+            >>> assert cfg_dict == dict(
+            ...     model=dict(backbone=dict(depth=50, with_cp=True)))
+        Args:
+            options (dict): dict of configs to merge from.
+        """
+        option_cfg_dict = {}
+        for full_key, v in options.items():
+            d = option_cfg_dict
+            key_list = full_key.split('.')
+            for subkey in key_list[:-1]:
+                d.setdefault(subkey, ConfigDict())
+                d = d[subkey]
+            subkey = key_list[-1]
+            d[subkey] = v
+
+        cfg_dict = super(Config, self).__getattribute__('_cfg_dict')
+        super(Config, self).__setattr__(
+            '_cfg_dict', Config._merge_a_into_b(option_cfg_dict, cfg_dict))
+
+
 
 """
 dist util
@@ -272,6 +559,7 @@ def merge_config():
             dist_print('merge ', item, ' config')
             setattr(cfg, item, getattr(args, item))
     return args, cfg
+
 
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
